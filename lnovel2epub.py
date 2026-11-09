@@ -1,132 +1,33 @@
 #!/usr/bin/env python3
-"""lnovel2epub —— 从 lnovel.tw（輕小說百科）抓取轻小说正文，打包成 EPUB3。
+"""lnovel2epub —— 把在线小说站上的书抓下来，打包成 EPUB3。
 
 用法：
-    python3 lnovel2epub.py 3217                     # 书号
-    python3 lnovel2epub.py https://lnovel.tw/books-3217
-    python3 lnovel2epub.py 3217 --out ~/books       # 落库根目录（默认 ./books）
-    python3 lnovel2epub.py 3217 --simplified        # 繁转简（需要 opencc）
-    python3 lnovel2epub.py 3217 --no-images         # 跳过插图
+    python3 lnovel2epub.py 活着                          # 书名：依次在各书源里搜，取第一个命中
+    python3 lnovel2epub.py 活着 --list                   # 只列出各书源的搜索结果，不下载
+    python3 lnovel2epub.py <书页链接>                    # 认得的站点直接抓
+    python3 lnovel2epub.py 3217                          # 纯数字 = lnovel.tw 书号（兼容旧用法）
+    python3 lnovel2epub.py 青春豬頭少年 --volume 1       # 多卷书选一卷；--volume 0 = 全部合成一本
+    python3 lnovel2epub.py 活着 --source kanunu          # 只用某个书源
+    python3 lnovel2epub.py --reindex                     # 重建需要本地索引的书源（努努书坊）
+    选项：--out 目录  --simplified 繁转简  --no-images  --json
 
 只依赖 ebooklib + pillow（繁转简额外需要 opencc-python-reimplemented）。
 """
 from __future__ import annotations
 
 import argparse
-import html as htmllib
 import io
 import json
 import os
 import re
-import sys
-import time
-import urllib.request
 
-BASE = "https://lnovel.tw"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-EXTS = (".jpg", ".jpeg", ".png", ".webp")
-
-
-def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
-
-
-def get(url: str, retries: int = 3) -> str:
-    last: Exception | None = None
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": BASE + "/"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return r.read().decode("utf-8", "ignore")
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            if attempt < retries - 1:
-                time.sleep(2 + attempt * 2)
-    raise RuntimeError(f"请求失败 {url}: {last}")
-
-
-def get_bytes(url: str) -> bytes | None:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": BASE + "/"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.read()
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def clean(fragment: str) -> str:
-    text = re.sub(r"<br\s*/?>", "\n", fragment)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = htmllib.unescape(text).replace("\xa0", " ")
-    return re.sub(r"[ \t]+", " ", text).strip()
+from sources import BY_NAME, SOURCES, kanunu, lnovel
+from sources.common import get_bytes, log
 
 
 def safe_name(name: str) -> str:
     name = re.sub(r"[\\/:*?\"<>|]", " ", name).strip()
     return re.sub(r"\s+", " ", name) or "未命名"
-
-
-def find_cover(page: str, title: str) -> str:
-    """封面：优先 og:image；否则按 alt==书名 找 <img>（属性顺序不固定，逐标签解析）。"""
-    m = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', page)
-    cover = m.group(1) if m else ""
-    if not cover:
-        for tag in re.findall(r"<img[^>]*>", page):
-            alt = re.search(r'alt="([^"]*)"', tag)
-            src = re.search(r'src="([^"]+)"', tag)
-            if alt and src and alt.group(1).strip() == title:
-                cover = src.group(1)
-                break
-    if cover.startswith("/"):
-        cover = BASE + cover
-    # 缩略图 .jpg.small.webp → 同图的 .jpg（270×360）
-    if cover.endswith(".small.webp"):
-        base = cover[: -len(".small.webp")]
-        if not re.search(r"\.(jpg|jpeg|png|webp)$", base, re.I):
-            base += ".jpg"
-        cover = base
-    return cover
-
-
-def crawl(book_id: str, with_images: bool = True) -> dict:
-    page = get(f"{BASE}/books-{book_id}")
-    title = clean(re.search(r"<title>(.*?)</title>", page, re.S).group(1)).split(" - ")[0]
-
-    author = ""
-    m = re.search(r"作者[\s\S]{0,120}?>\s*([^<\s][^<]{0,30})", page)
-    if m:
-        author = clean(m.group(1))
-
-    links: list[tuple[str, str]] = []
-    for href, name in re.findall(r'href="(/chapters-\d+)"[^>]*>(.*?)</a>', page, re.S):
-        if href not in [h for h, _ in links]:
-            links.append((href, clean(name) or f"第{len(links) + 1}节"))
-
-    chapters = []
-    for i, (href, name) in enumerate(links, 1):
-        ch_html = get(BASE + href)
-        art = re.search(r'<article class="card mb-4">(.*?)</article>', ch_html, re.S)
-        if not art:
-            log(f"warn: {href} 没有正文容器，跳过")
-            continue
-        body = art.group(1)
-        paras = [clean(p) for p in re.findall(r"<p[^>]*>(.*?)</p>", body, re.S)]
-        text = "\n\n".join(p for p in paras if p)
-        images: list[str] = []
-        if with_images:
-            for src in re.findall(r'<img[^>]*src="([^"]+)"', body):
-                if "/uploads/" in src:
-                    images.append(src if src.startswith("http") else BASE + src)
-        chapters.append({"title": name, "text": text, "images": images})
-        log(f"[{i}/{len(links)}] {name} {len(text)} 字{' · ' + str(len(images)) + ' 图' if images else ''}")
-
-    return {
-        "bookId": book_id,
-        "title": title,
-        "author": author,
-        "cover": find_cover(page, title),
-        "chapters": chapters,
-    }
 
 
 def to_jpeg(data: bytes) -> bytes | None:
@@ -165,32 +66,27 @@ def to_simplified(book: dict) -> dict:
     return out
 
 
-def build(book: dict, out_root: str, simplified: bool = False) -> str:
+def build(book: dict, out_root: str) -> str:
     from ebooklib import epub
 
-    if simplified:
-        book = to_simplified(book)
     title = safe_name(book["title"])
-
-    if not os.path.isdir(out_root):
-        os.makedirs(out_root, exist_ok=True)
+    os.makedirs(out_root, exist_ok=True)
     dest = os.path.join(out_root, title)
     os.makedirs(dest, exist_ok=True)
+    ref = book.get("referer")
 
     eb = epub.EpubBook()
-    eb.set_identifier(f"lnovel-{book['bookId']}")
+    eb.set_identifier(f"{book.get('source', 'lnovel')}-{book['bookId']}")
     eb.set_title(title)
     eb.set_language("zh")
     if book.get("author"):
         eb.add_author(book["author"])
 
-    cover = book.get("cover") or ""
-    if cover:
-        data = get_bytes(cover)
-        if data:
-            jpeg = to_jpeg(data)
-            if jpeg:
-                eb.set_cover("cover.jpg", jpeg)
+    if book.get("cover"):
+        data = get_bytes(book["cover"], ref)
+        jpeg = to_jpeg(data) if data else None
+        if jpeg:
+            eb.set_cover("cover.jpg", jpeg)
 
     items = []
     for idx, ch in enumerate(book["chapters"], 1):
@@ -202,7 +98,7 @@ def build(book: dict, out_root: str, simplified: bool = False) -> str:
         html = [f"<h2>{name}</h2>"]
         html += [f"<p>{p}</p>" for p in paragraphs]
         for j, url in enumerate(images, 1):
-            data = get_bytes(url)
+            data = get_bytes(url, ref)
             jpeg = to_jpeg(data) if data else None
             if not jpeg:
                 continue
@@ -225,25 +121,91 @@ def build(book: dict, out_root: str, simplified: bool = False) -> str:
     return path
 
 
+def resolve(target: str, only: str | None) -> tuple[object, str] | list[dict]:
+    """链接/书号 → (书源, id)；书名 → 搜索结果列表。"""
+    pool = [BY_NAME[only]] if only else SOURCES
+    for src in pool:
+        bid = src.match(target)
+        if bid:
+            return src, bid
+    if target.isdigit() and (not only or only == lnovel.NAME):
+        return lnovel, target
+    if re.match(r"https?://", target):
+        raise SystemExit(f"不认识这个链接：{target}（支持：{', '.join(s.NAME for s in SOURCES)}）")
+    hits = []
+    for src in pool:
+        try:
+            found = src.search(target)
+        except Exception as exc:  # noqa: BLE001
+            log(f"warn: {src.NAME} 搜索失败：{exc}")
+            continue
+        log(f"{src.NAME}: {len(found)} 条")
+        hits += found
+    norm = _normalizer()
+    kw = norm(target)
+    order = {s.NAME: i for i, s in enumerate(pool)}
+
+    def rank(h):
+        t = norm(h["title"])
+        return (0 if t == kw else 1 if t.startswith(kw) else 2, len(t), order[h["source"]])
+    return sorted(hits, key=rank)
+
+
+def _normalizer():
+    """比较书名用：去空白和书名号；装了 opencc 就统一成简体（「活著」==「活着」）。"""
+    try:
+        import opencc
+        cc = opencc.OpenCC("t2s").convert
+    except ImportError:
+        cc = lambda s: s  # noqa: E731
+    return lambda s: cc(re.sub(r"[\s《》]", "", s))
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="抓 lnovel.tw 轻小说并打包 EPUB")
-    ap.add_argument("target", help="书号或 https://lnovel.tw/books-<id>")
+    ap = argparse.ArgumentParser(description="抓在线小说并打包 EPUB（书源：" + " / ".join(s.NAME for s in SOURCES) + "）")
+    ap.add_argument("target", nargs="?", help="书名、书页链接，或 lnovel.tw 书号")
+    ap.add_argument("--source", choices=list(BY_NAME), help="只用某个书源")
+    ap.add_argument("--list", action="store_true", help="只列出搜索结果，不下载")
+    ap.add_argument("--pick", type=int, default=1, help="书名搜索时取第几条结果（默认 1）")
+    ap.add_argument("--volume", type=int, help="多卷书选第几卷；0 = 全部合成一本")
+    ap.add_argument("--reindex", action="store_true", help="重建努努书坊的本地书名索引")
     ap.add_argument("--out", default=os.environ.get("NOVEL_DIR", "./books"), help="落库根目录（默认 ./books）")
     ap.add_argument("--simplified", action="store_true", help="繁体转简体（需要 opencc）")
     ap.add_argument("--no-images", action="store_true", help="跳过插图")
     ap.add_argument("--json", action="store_true", help="只输出结果 JSON")
     a = ap.parse_args()
 
-    m = re.search(r"(\d+)", a.target)
-    if not m:
-        raise SystemExit(f"解析不出书号：{a.target}")
-    book_id = m.group(1)
+    if a.reindex:
+        kanunu.build_index()
+        if not a.target:
+            return
+    if not a.target:
+        ap.error("缺少书名或链接")
 
-    book = crawl(book_id, with_images=not a.no_images)
+    r = resolve(a.target.strip(), a.source)
+    if isinstance(r, list):
+        if a.list or not r:
+            for i, h in enumerate(r, 1):
+                print(f"{i}. [{h['source']}] {h['title']}" + (f" — {h['author']}" if h.get("author") else "") + f"  ({h['id']})")
+            if not r:
+                raise SystemExit(f"各书源都没搜到「{a.target}」。努努书坊的书可以直接给书页链接。")
+            return
+        if not 1 <= a.pick <= len(r):
+            raise SystemExit(f"--pick 超出范围：共 {len(r)} 条")
+        h = r[a.pick - 1]
+        log(f"选中：[{h['source']}] {h['title']}" + (f"（共 {len(r)} 条，--list 看全部）" if len(r) > 1 else ""))
+        src, bid = BY_NAME[h["source"]], h["id"]
+    else:
+        src, bid = r
+
+    book = src.crawl(bid, with_images=not a.no_images, volume=a.volume)
+    if not book["chapters"]:
+        raise SystemExit("一章正文都没拿到，不生成空书")
     if a.simplified:
         book = to_simplified(book)
     path = build(book, a.out)
     result = {
+        "source": book["source"],
         "title": book["title"],
         "author": book.get("author") or None,
         "chapters": len(book["chapters"]),
@@ -255,7 +217,7 @@ def main() -> None:
     if a.json:
         print(json.dumps(result, ensure_ascii=False))
     else:
-        log(f"完成：{result['title']}（{result['chapters']} 节 / {result['chars']} 字 / "
+        log(f"完成：{result['title']}（{result['source']} · {result['chapters']} 节 / {result['chars']} 字 / "
             f"{result['images']} 图 / {result['size'] // 1024}K）")
         print(os.path.abspath(path))
 

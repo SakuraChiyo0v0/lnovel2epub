@@ -9,5 +9,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python -m py_compile lnovel2epub.py
+      - run: python -m py_compile lnovel2epub.py sources/*.py
       - run: python lnovel2epub.py --help
