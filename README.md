@@ -38,7 +38,7 @@ python3 lnovel2epub.py https://lnovel.tw/books-3217
 # 指定落库目录（默认 ./books）
 python3 lnovel2epub.py 3217 --out ~/novels
 
-# 繁体转简体（书名和正文一起转）
+# 繁体转简体（书名、作者、章节名、正文一起转；没装 opencc 会直接报错）
 python3 lnovel2epub.py 3217 --simplified
 
 # 只要文字，不要插图

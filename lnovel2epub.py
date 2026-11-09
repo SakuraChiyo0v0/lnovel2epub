@@ -144,18 +144,33 @@ def to_jpeg(data: bytes) -> bytes | None:
         return None
 
 
+def to_simplified(book: dict) -> dict:
+    """繁转简：书名、作者、章节名、正文全部转换，返回新 dict，不改原对象。
+
+    没装 opencc 直接报错退出：静默跳过会产出一本「以为是简体、其实是繁体」的书。
+    """
+    try:
+        import opencc
+    except ImportError:
+        raise SystemExit("--simplified 需要 opencc：pip install opencc-python-reimplemented")
+    cc = opencc.OpenCC("t2s")
+    conv = lambda v: cc.convert(v) if isinstance(v, str) else v  # noqa: E731
+    out = dict(book)
+    out["title"] = conv(book.get("title") or "")
+    out["author"] = conv(book.get("author") or "")
+    out["chapters"] = [
+        {**ch, "title": conv(ch.get("title") or ""), "text": conv(ch.get("text") or "")}
+        for ch in book.get("chapters", [])
+    ]
+    return out
+
+
 def build(book: dict, out_root: str, simplified: bool = False) -> str:
     from ebooklib import epub
 
-    title = safe_name(book["title"])
     if simplified:
-        try:
-            import opencc
-
-            cc = opencc.OpenCC("t2s")
-            title = safe_name(cc.convert(title))
-        except ImportError:
-            log("warn: 没装 opencc-python-reimplemented，跳过繁转简")
+        book = to_simplified(book)
+    title = safe_name(book["title"])
 
     if not os.path.isdir(out_root):
         os.makedirs(out_root, exist_ok=True)
@@ -225,7 +240,9 @@ def main() -> None:
     book_id = m.group(1)
 
     book = crawl(book_id, with_images=not a.no_images)
-    path = build(book, a.out, simplified=a.simplified)
+    if a.simplified:
+        book = to_simplified(book)
+    path = build(book, a.out)
     result = {
         "title": book["title"],
         "author": book.get("author") or None,
